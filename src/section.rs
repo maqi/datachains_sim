@@ -17,7 +17,7 @@ pub struct Section {
     nodes: HashMap<Name, Node>,
     chain: Chain,
     requests: Vec<Request>,
-    incoming_relocations: HashMap<Name, Name>,
+    pub incoming_relocations: HashMap<Name, Name>,
     outgoing_relocations: HashSet<Name>,
 }
 
@@ -51,8 +51,27 @@ impl Section {
         !self.incoming_relocations.is_empty()
     }
 
-    pub fn receive(&mut self, request: Request) {
-        self.requests.push(request)
+    pub fn receive(&mut self, request: Request) -> Vec<Response> {
+        match self.state {
+            State::Stable => {}
+            State::Splitting => {
+                debug!(
+                    "section {:?} is splitted, re-sending request {:?} to self",
+                    self.prefix,
+                    request
+                );
+                // Forward the request to self will make a redelivery attempt in the next round.
+                // Which the self section shall get removed from network,
+                // allowing the descendants to receive the message
+                return vec![Response::Send(self.prefix, request)];
+            }
+            State::Merging(prefix) => {
+                return vec![Response::Send(prefix, request)];
+            }
+        }
+
+        self.requests.push(request);
+        Vec::new()
     }
 
     pub fn handle_requests(&mut self, params: &Params) -> Vec<Response> {
@@ -80,7 +99,7 @@ impl Section {
                 Request::RelocateReject { dst, node_name } => {
                     self.handle_relocate_reject(dst, node_name)
                 }
-                Request::Relocate(node) => self.handle_relocate(params, node),
+                Request::Relocate { dst, node } => self.handle_relocate(params, dst, node),
             })
         }
 
@@ -188,15 +207,26 @@ impl Section {
         let mut section = Section::new(parent);
         section.chain = self.chain.clone();
         section.nodes = mem::replace(&mut self.nodes, HashMap::default());
+        section.outgoing_relocations =
+            mem::replace(&mut self.outgoing_relocations, HashSet::default());
+        section.incoming_relocations =
+            mem::replace(&mut self.incoming_relocations, HashMap::default());
 
         self.state = State::Merging(parent);
 
         vec![Response::Merge(section, self.prefix)]
     }
 
-    fn handle_relocate(&mut self, params: &Params, node: Node) -> Vec<Response> {
+    fn handle_relocate(&mut self, params: &Params, dst: Name, node: Node) -> Vec<Response> {
+        debug!(
+            "section {:?} received relocated node {:?} with incoming cache {:?} and nodes {:?}",
+            self.prefix,
+            node.name(),
+            self.incoming_relocations,
+            self.nodes.values()
+        );
         if let Some(prefix) = self.forward(node.name()) {
-            return vec![Response::Send(prefix, Request::Relocate(node))];
+            return vec![Response::Send(prefix, Request::Relocate { dst, node })];
         }
 
         if self.incoming_relocations.remove(&node.name()).is_none() {
@@ -234,6 +264,14 @@ impl Section {
         dst: Name,
         node_name: Name,
     ) -> Vec<Response> {
+        debug!(
+            "section {:?} received relocate request of {:?} from {:?} with incoming cache {:?} and nodes {:?}",
+            self.prefix,
+            node_name,
+            src,
+            self.incoming_relocations,
+            self.nodes.values()
+        );
         if !self.incoming_relocations.is_empty() || self.nodes.len() >= params.max_section_size {
             vec![
                 Response::Send(src, Request::RelocateReject { dst, node_name }),
@@ -247,6 +285,18 @@ impl Section {
     }
 
     fn handle_relocate_accept(&mut self, dst: Name, node_name: Name) -> Vec<Response> {
+        debug!(
+            "section {:?} received relocate accept of {:?} with outgoing cache {:?} and nodes {:?}",
+            self.prefix,
+            node_name,
+            self.outgoing_relocations,
+            self.nodes.values()
+        );
+        if let Some(prefix) = self.forward(node_name) {
+            return vec![
+                Response::Send(prefix, Request::RelocateAccept { dst, node_name }),
+            ];
+        }
         if self.outgoing_relocations.remove(&node_name) {
             if let Some(mut node) = self.nodes.remove(&node_name) {
                 node.increment_age();
@@ -263,6 +313,13 @@ impl Section {
     }
 
     fn handle_relocate_reject(&self, dst: Name, node_name: Name) -> Vec<Response> {
+        debug!(
+            "section {:?} received relocate reject of {:?} with outgoing cache {:?} and nodes {:?}",
+            self.prefix,
+            node_name,
+            self.outgoing_relocations,
+            self.nodes.values()
+        );
         if self.outgoing_relocations.contains(&node_name) {
             let dst = Name(Hash::new_from_u64(dst.0).hash().to_u64());
             vec![
@@ -563,11 +620,11 @@ impl Section {
 
 impl fmt::Debug for Section {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "Section({})", self.prefix)
+        write!(fmt, "Section({}) state: {:?}", self.prefix, self.state)
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
     Stable,
     Splitting,

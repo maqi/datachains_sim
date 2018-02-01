@@ -154,7 +154,7 @@ fn get_params() -> Params {
                 .long("max-relocation-attempts")
                 .help("Maximum number of relocation attempts after a Live event")
                 .takes_value(true)
-                .default_value("5"),
+                .default_value("25"),
         )
         .arg(
             Arg::with_name("MAX_INFANTS_PER_SECTION")

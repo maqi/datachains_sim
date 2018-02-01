@@ -5,7 +5,7 @@ use section::Section;
 /// Network message (RPC).
 /// Note: these do not necessarily correspond to the RPCs of the real network,
 /// because this simulation abstracts of the real stuff away.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Request {
     /// A node joins the network.
     Live(Node),
@@ -20,7 +20,7 @@ pub enum Request {
         node_name: Name,
     },
     /// Relocate the given node to section.
-    Relocate(Node),
+    Relocate { dst: Name, node: Node },
     /// Accept the relocation request.
     RelocateAccept { dst: Name, node_name: Name },
     /// Reject the relocation request.

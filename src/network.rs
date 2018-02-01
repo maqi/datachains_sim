@@ -7,6 +7,7 @@ use prefix::{Name, Prefix};
 use random;
 use section::Section;
 use stats::{Distribution, Stats};
+use std::mem;
 use std::ops::AddAssign;
 
 pub struct Network {
@@ -90,7 +91,11 @@ impl Network {
 
         for section in self.sections.values_mut() {
             if section.has_incoming_relocation() {
-                continue;
+                panic!(
+                    "section {:?} having non-empty incoming cache {:?}",
+                    section.prefix(),
+                    section.incoming_relocations
+                );
             }
 
             if random::gen() {
@@ -139,78 +144,92 @@ impl Network {
     fn handle_responses(&mut self, responses: &mut Vec<Response>) -> TickStats {
         let mut stats = TickStats::new();
 
-        for response in responses.drain(..) {
-            match response {
-                Response::Merge(section, old_prefix) => {
-                    self.sections
-                        .entry(section.prefix())
-                        .or_insert_with(|| {
-                            stats.merges += 1;
-                            Section::new(section.prefix())
-                        })
-                        .merge(&self.params, section);
-                    let _ = self.sections.remove(&old_prefix);
-                }
-                Response::Split(section0, section1, old_prefix) => {
-                    stats.splits += 1;
+        let mut resps = mem::replace(responses, Vec::new());
+        loop {
+            let mut forwarded_requests: Vec<Response> = Vec::new();
+            for response in resps.drain(..) {
+                match response {
+                    Response::Merge(section, old_prefix) => {
+                        self.sections
+                            .entry(section.prefix())
+                            .or_insert_with(|| {
+                                stats.merges += 1;
+                                Section::new(section.prefix())
+                            })
+                            .merge(&self.params, section);
+                        let _ = self.sections.remove(&old_prefix);
+                    }
+                    Response::Split(section0, section1, old_prefix) => {
+                        stats.splits += 1;
 
-                    let prefix0 = section0.prefix();
-                    let prefix1 = section1.prefix();
+                        let prefix0 = section0.prefix();
+                        let prefix1 = section1.prefix();
 
-                    assert!(
-                        self.sections.insert(prefix0, section0).is_none(),
-                        "section with prefix [{}] already exists",
-                        prefix0
-                    );
-                    assert!(
-                        self.sections.insert(prefix1, section1).is_none(),
-                        "section with prefix [{}] already exists",
-                        prefix1
-                    );
+                        assert!(
+                            self.sections.insert(prefix0, section0).is_none(),
+                            "section with prefix [{}] already exists",
+                            prefix0
+                        );
+                        assert!(
+                            self.sections.insert(prefix1, section1).is_none(),
+                            "section with prefix [{}] already exists",
+                            prefix1
+                        );
 
-                    let _ = self.sections.remove(&old_prefix);
-                }
-                Response::Reject(_) => {
-                    stats.rejections += 1;
-                }
-                Response::RelocateRequest {
-                    src,
-                    dst,
-                    node_name,
-                } => {
-                    let section = self.find_matching_section(dst);
-                    section.receive(Request::RelocateRequest {
+                        let _ = self.sections.remove(&old_prefix);
+                    }
+                    Response::Reject(_) => {
+                        stats.rejections += 1;
+                    }
+                    Response::RelocateRequest {
                         src,
                         dst,
                         node_name,
-                    })
-                }
-                Response::Relocate { dst, node } => {
-                    stats.relocations += 1;
-                    let section = self.find_matching_section(dst);
-                    section.receive(Request::Relocate(node))
-                }
-                Response::Send(prefix, request) => {
-                    match request {
-                        Request::Merge(target_prefix) => {
-                            // The receiver of `Merge` might not exists, because
-                            // it might have already split. So send the request
-                            // to every section with matching prefix.
-                            for section in self.sections.values_mut().filter(|section| {
-                                prefix.is_ancestor(&section.prefix())
-                            })
-                            {
-                                section.receive(Request::Merge(target_prefix))
+                    } => {
+                        let section = self.find_matching_section(dst);
+                        forwarded_requests.extend(section.receive(Request::RelocateRequest {
+                            src,
+                            dst,
+                            node_name,
+                        }));
+                    }
+                    Response::Relocate { dst, node } => {
+                        stats.relocations += 1;
+                        let section = self.find_matching_section(dst);
+                        forwarded_requests.extend(section.receive(Request::Relocate { dst, node }));
+                    }
+                    Response::Send(prefix, request) => {
+                        match request {
+                            Request::Merge(target_prefix) => {
+                                // The receiver of `Merge` might not exists, because
+                                // it might have already split. So send the request
+                                // to every section with matching prefix.
+                                for section in self.sections.values_mut().filter(|section| {
+                                    prefix.is_ancestor(&section.prefix())
+                                })
+                                {
+                                    forwarded_requests.extend(section.receive(
+                                        Request::Merge(target_prefix),
+                                    ));
+                                }
                             }
+                            Request::Relocate { dst, node } => {
+                                stats.relocations += 1;
+                                forwarded_requests.extend(self.send(
+                                    prefix,
+                                    Request::Relocate { dst, node },
+                                ));
+                            }
+                            _ => forwarded_requests.extend(self.send(prefix, request)),
                         }
-                        Request::Relocate(node) => {
-                            stats.relocations += 1;
-                            self.send(prefix, Request::Relocate(node));
-                        }
-                        _ => self.send(prefix, request),
                     }
                 }
             }
+
+            if forwarded_requests.is_empty() {
+                break;
+            }
+            resps = mem::replace(&mut forwarded_requests, Vec::new());
         }
 
         stats
@@ -227,18 +246,33 @@ impl Network {
         }
     }
 
-    fn send(&mut self, prefix: Prefix, request: Request) {
+    fn send(&mut self, prefix: Prefix, request: Request) -> Vec<Response> {
         if let Some(section) = self.sections.get_mut(&prefix) {
-            section.receive(request)
-        } else {
-            debug!(
+            return section.receive(request);
+        }
+
+        debug!(
                 "{} {} {} {}",
                 log::error("Section with prefix"),
                 log::prefix(&prefix),
                 log::error("not found for request"),
                 log::message(&request),
             );
+        if let Some(section) = self.sections.values_mut().find(|section| {
+            section.prefix().is_ancestor(&prefix)
+        })
+        {
+            return section.receive(request);
         }
+
+        let mut section = match request {
+            Request::RelocateRequest { dst, .. } |
+            Request::Relocate { dst, .. } => self.find_matching_section(dst),
+            Request::RelocateAccept { node_name, .. } |
+            Request::RelocateReject { node_name, .. } => self.find_matching_section(node_name),
+            _ => unreachable!(),
+        };
+        section.receive(request)
     }
 
     fn check_section_sizes(&self) -> bool {

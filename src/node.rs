@@ -3,7 +3,7 @@ use params::Params;
 use prefix::{Name, Prefix};
 use std::fmt;
 
-#[derive(Eq, PartialEq, Hash)]
+#[derive(Clone, Eq, PartialEq, Hash)]
 pub struct Node {
     name: Name,
     age: Age,
